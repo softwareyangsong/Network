@@ -1,0 +1,293 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Threading;
+using System.Net;
+using System.Net.Sockets;
+using System.IO;
+
+
+namespace Network
+{
+    public class BaseNetwork<T>  where T : INetMessage
+    {
+        private static BaseNetwork<T> instance = null;
+        public static BaseNetwork<T> getInstance()
+        {
+            if (instance == null)
+            {
+                instance = new BaseNetwork<T>();
+            }
+            return instance;
+        }
+
+        public delegate void OnStartConnectHandler();
+
+        public delegate void OnActiveDisConnectedHandler();
+
+        public delegate void OnPassiveDisConnectedHandler();
+
+        public delegate void OnConnectFailedHandler();
+
+        public delegate void OnConnectSuccessedHandler();
+
+        public OnStartConnectHandler onStartConnectHandler = null;
+
+        public OnActiveDisConnectedHandler onActiveDisConnectedHandler = null;
+
+        public OnPassiveDisConnectedHandler onPassiveDisConnectedHandler = null;
+
+        public OnConnectFailedHandler onConnectFailedHandler = null;
+
+        public OnConnectSuccessedHandler onConnectSuccessedHandler = null;
+
+        public enum State
+        { 
+            Disconnected,
+            Connecting,
+            Connected
+        }
+
+        public const int CLOSE_TIMEOUT = 1000;
+
+        public const int BUFFER_SIZE = 2048;
+
+        public const int POOL_INIT_SIZE = 32;
+
+        protected ObjectPool<T> msgPool = null;
+
+        protected Queue<T> sendQueue = null;
+
+        protected Queue<T> recvQueue = null;
+
+        protected byte[] sendBuffer = null;
+        
+        protected byte[] recvBuffer = null;
+
+        protected Thread sender = null;
+
+        protected Thread recver = null;
+
+        protected Thread connector = null;
+
+        protected bool senderRunnable = false;
+        
+        protected bool recverRunnable = false;
+
+        protected NetSocket socket = null;
+
+        protected State state = State.Disconnected;
+
+        private bool activeClose = false;
+
+        protected bool dataProcessible = true;
+
+        protected BaseNetwork()
+        {
+            socket = new NetSocket();
+            msgPool = new ObjectPool<T>(POOL_INIT_SIZE);
+            sendQueue = new Queue<T>();
+            recvQueue = new Queue<T>();
+            sendBuffer = new byte[BUFFER_SIZE];
+            recvBuffer = new byte[BUFFER_SIZE];
+        }
+
+        public void connect(string ip, int port, int timeout)
+        {
+            if (state != State.Disconnected)
+            {
+                return;
+            }
+
+            onStartConnectHandler();
+            state = State.Connecting;
+            connector = new Thread(
+                    delegate()
+                    {
+                        if (socket.connect(ip, port, timeout))
+                        {
+                            activeClose = false;
+                            senderRunnable = true;
+                            recverRunnable = true;
+                            sender = new Thread(doSend);
+                            recver = new Thread(doRecv);
+                            state = State.Connected;
+                            onConnectSuccessedHandler();
+                            sender.Start();
+                            recver.Start();
+                        }
+                        else
+                        {
+                            state = State.Disconnected;
+                            onConnectFailedHandler();
+                        }
+                    }
+                );
+            connector.Start();
+        }
+
+
+        protected virtual void doSend()
+        {
+            while (senderRunnable)
+            { 
+                T t = default(T);
+                lock (sendQueue)
+                {
+                    if (sendQueue.Count > 0)
+                    {
+                        t = sendQueue.Dequeue();
+                    }
+                }
+                if (t != null)
+                {
+                    int len = 0;
+                    try
+                    {
+                        if (t.encode(sendBuffer, 0, out len))
+                        {
+                            socket.send(sendBuffer, len);
+                        }
+                    }
+                    catch (SocketException e)
+                    {
+                        doDisconnect();
+                    }
+                    msgPool.recycle(t);
+                }
+            }
+        }
+
+        public bool send(byte[] data, int length)
+        {
+            if (data == null || length <= 0 || state == State.Connected)
+            {
+                return false;
+            }
+            T t = msgPool.rent();
+            t.decode(data , 0 , length);
+            lock (sendQueue)
+            {
+                sendQueue.Enqueue(t);
+            }
+            return true;
+        }
+
+        protected void doDisconnect()
+        {
+            if (!activeClose)
+            {
+                state = State.Disconnected;
+                onPassiveDisConnectedHandler();
+                close(false);
+            }
+        }
+
+
+        void close(bool useJoin)
+        {
+            if (connector != null && connector.IsAlive)
+            {
+                connector.Abort();
+            }
+            senderRunnable = false;
+            recverRunnable = false;
+            clear();
+            socket.close();
+
+            if (useJoin && sender != null && sender.ThreadState == ThreadState.Running)
+            {
+                sender.Join();
+            }
+
+            if (useJoin && sender != null && recver.ThreadState == ThreadState.Running)
+            {
+                sender.Join();
+            }
+
+            if (activeClose && this.state != State.Disconnected)
+            {
+                state = State.Disconnected;
+                onActiveDisConnectedHandler();
+            }
+        }
+
+        protected virtual void doRecv()
+        {
+            try
+            {
+                while (recverRunnable)
+                {
+                    int length = 0;
+                    try
+                    {
+                        length = socket.recv(recvBuffer, 0, 2);
+                        Utils.swap(recvBuffer, 2);
+                        ushort len = BitConverter.ToUInt16(recvBuffer, 0);
+                        length = socket.recv(recvBuffer, 0, len);
+                        T t = msgPool.rent();
+                        t.decode(recvBuffer, 0, len);
+                        lock (recvQueue)
+                        {
+                            recvQueue.Enqueue(t);
+                        }
+                    }
+                    catch (SocketException ex)
+                    {
+                        doDisconnect();
+                        throw ex;
+                    }
+
+                }
+            }
+            catch (Exception e)
+            {
+                doDisconnect();
+                throw e;
+            }
+        }
+
+        public void clear()
+        {
+            lock (sendQueue)
+            {
+                foreach (T t in sendQueue)
+                {
+                    msgPool.recycle(t);
+                }
+                sendQueue.Clear();
+            }
+            lock (recvQueue)
+            {
+                foreach (T t in recvQueue)
+                {
+                    msgPool.recycle(t);
+                }
+                recvQueue.Clear();
+            }
+        }
+
+        public virtual void update()
+        {
+            if (!dataProcessible)
+            {
+                return;
+            }
+        }
+
+        public State getState()
+        {
+            return state;
+        }
+
+        public int getSendQueueSize()
+        {
+            return sendQueue.Count;
+        }
+
+        public int getRecvQueueSize()
+        {
+            return recvQueue.Count;
+        }
+    }
+}
